@@ -8,7 +8,6 @@ import org.springframework.boot.test.context.SpringBootTest;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadLocalRandom;
 
 import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
 
@@ -52,6 +51,10 @@ class ApplyServiceTest {
         }
 
         latch.await();
+
+        // kafka producer에서 데이터 전송이 완료된 시점에서 쿠폰 개수를 조회
+        // consumer에서는 이 시점에 모든 쿠폰을 생성하지 않았기 때문에 실패하는 것을 ThreadSleep을 통해 일시적으로 방지
+        Thread.sleep(1000);
 
         // 모든 요청 완료 시 생성된 쿠폰 개수 확인
         long count = couponRepository.count();
