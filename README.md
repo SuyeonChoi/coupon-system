@@ -158,6 +158,137 @@ public void apply(Long userId) {
 
 
 ## Kafka를 활용하여 문제 해결하기
+> 카프카란?  
+>   분산 이벤트 스트리밍 플랫폼. 소스에서 목적지까지 이벤트를 실시간으로 스트리밍
+>   카프카는 프로듀서에서 컨슈머까지 데이터를 실시간으로 스트리밍할 수 있도록 도와주는 플랫폼
+
+- 카프카 기본 구조
+  - Topic : 큐
+  - Producer: 토픽에 데이터를 삽입할 수 있음
+  - Consumer: 토픽에 삽입된 데이터를 가져갈 수 있음
+
+카프카를 활용하면 프로듀서를 통해 쿠폰을 생성할 유저 아이디를 토픽에 넣고, 컨슈머를 사용해 유저 아이디를 가져와 쿠폰을 생성할 수 있다
+- [kafka producer 추가](https://github.com/SuyeonChoi/coupon-system/commit/5083f6ae1d1ddac72bd6d389bca1b8161ba5f21c)
+- [kafka consumer 추가](https://github.com/SuyeonChoi/coupon-system/commit/441fb591ac65d7eb9030abce71618084ddf0aa8c)
+- 카프카를 사용하면 API에서 직접 쿠폰을 생성할 때에 비해 처리량을 조절할 수 있다.
+    - DB 부하 감소 가능. 다만 consumer처리까지 약간의 시간 발생
+ 
+### 발급 가능한 쿠폰 개수가 인당 1개로 제한되는 경우
+
+- 해결방법1 - DB unique key 사용
+    - Coupon에 userId, couponType 두 컬럼으로 unique key를 걸어 1개만 생성되도록 DB에서 막는 방법
+    - 보통 서비스에서 한 유저가 같은 타입의 쿠폰을 여러개 가질 수 있으므로 실용적이지 않음
+    
+    ```java
+    @Entity
+    public class Coupon {
+    
+        @Id
+        @GeneratedValue(strategy = GenerationType.IDENTITY)
+        private Long id;
+    
+        private Long userId;
+        
+        private Long couponType;
+    }
+    ```
+
+- 해결방법2 - lock 범위를 잡고, 처음에 쿠폰 발급 여부를 가져와서 판단하기
+  ![image](https://github.com/user-attachments/assets/84dc960c-0b44-48d6-9992-c4856d7106e2)
+
+  - 위 그림과 다르게 consumer가 아닌 API에서 쿠폰 발급 한다고 해도 락 범위가 너무 넓어짐. 성능 이슈 우려
+  ```java
+    public void apply(Long userId) {
+        // lock start
+        // 쿠폰발급 여부
+        // if(발급됐다면) return
+        Long count = couponCountRepository.increment();
+        if (count > 100) {
+            return; // 발급하지 않음
+        }
+        couponCreateProducer.create(userId);
+        // lock end
+    }
+  ```
+
+- 해결방법3 - Redis의 set 자료구조 활용하기
+  - 유저가 쿠폰 응모를 하면 set에 추가
+  - set에 존재하지 않으면 발급 진행하고 이미 존재하는 유저라면 발급하지 않는다
+  - [코드 전체 예시](https://github.com/SuyeonChoi/coupon-system/commit/e86f969f92eceb26d540a51246dda3990e12e356#diff-de2762f9b230d6340ef637d4a66214a6ff0aab2c9683d220f44e8d8b6cc99cf3)
+  ```java
+    @Repository
+    public class AppliedUserRepository {
+    
+        private final RedisTemplate<String, String> redisTemplate;
+    
+        public AppliedUserRepository(RedisTemplate<String, String> redisTemplate) {
+            this.redisTemplate = redisTemplate;
+        }
+    
+        public Long add(Long userId) {
+            return redisTemplate
+                    .opsForSet()
+                    .add("applied_user", userId.toString());
+        }
+    }
+
+    // ApplyService
+    public void apply(Long userId) {
+        Long apply = appliedUserRepository.add(userId);Add commentMore actions
+
+        if (apply != 1) { // 이미 발급 요청을 한 유저
+            return;
+        }
+       // 기존 로직...
+     }
+  ```
+
+## Consumer에서 오류가 나는 경우?
+
+- 현재 시스템에서는 consumer에서 토픽에 있는 데이터를 가져간 후, 쿠폰 발급 과정에서 에러가 나면 쿠폰은 발급되지 않았는데 발급된 쿠폰 개수만 올라가는 문제 발생 가능
+  - 100개보다 적은 쿠폰이 발급됨 
 
 
+### 해결방법 - 백업 데이터와 로그 남기기
+- 보다 안전한 시스템을 만들기 위해 consumer에서 에러가 발생했을 때 처리하는 방법 ([코드](https://github.com/SuyeonChoi/coupon-system/commit/5b897e0285a6b0ac9bcba2ec426afee58eecb191))
 
+```java
+// CouponCreatedConsumer
+@KafkaListener(topics = "coupon_create", groupId = "group_1")
+public void listener(Long userId) {
+    couponRepository.save(new Coupon(userId));
+    try {
+        couponRepository.save(new Coupon(userId));
+    } catch (Exception e) {
+        logger.error("failed to create coupon::", + userId); // 로그 남기기
+        failedEventRepository.save(new FailedEvent(userId)); // 백업 데이터
+    }
+}
+
+// 쿠폰 발급에 실패한 데이터
+@Entity
+public class FailedEvent {
+
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private Long userId;
+
+    public FailedEvent() {
+    }
+
+    public FailedEvent(Long userId) {
+        this.userId = userId;
+    }
+}
+```
+
+
+## 정리
+![image](https://github.com/user-attachments/assets/e0ca8066-cdce-4039-a12b-71ec7d0deb42)
+
+- API에서 쿠폰 발급을 요청할 때 토픽에 데이터를 넣는다
+- 컨슈머에서 토픽의 데이터를 가져와 쿠폰 발급을 진행
+- 쿠폰을 발급하면서 에러가 발생하면 FailedEvent에 실패한 이벤트 저장
+- 이후에 별도의 배치 프로그램에서 FailedEvent에 쌓인 데이터를 주기적으로 읽어 쿠폰을 발급해준다면 결과적으로 100개의 쿠폰 발급 가능
+  
